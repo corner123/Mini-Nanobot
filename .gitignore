@@ -1,0 +1,10 @@
+.nanobot/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.log
+.venv/
+dist/
+build/
+*.egg-info/

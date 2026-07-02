@@ -1,0 +1,14 @@
+[
+  {
+    "name": "list-files-offline",
+    "prompt": "list files in the workspace",
+    "expect_contains": "CC源码-自己总结.md",
+    "max_turns": 4
+  },
+  {
+    "name": "search-offline",
+    "prompt": "search TODO in the workspace",
+    "expect_contains": "Mini-Nanobot offline model finished",
+    "max_turns": 4
+  }
+]

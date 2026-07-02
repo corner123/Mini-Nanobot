@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+set -u
+
+branch="$(git symbolic-ref --quiet --short HEAD || true)"
+if [ -z "$branch" ]; then
+  exit 0
+fi
+
+remote="${NANOBOT_AUTO_PUSH_REMOTE:-origin}"
+
+if ! git remote get-url "$remote" >/dev/null 2>&1; then
+  echo "post-commit auto-push skipped: remote '$remote' is not configured" >&2
+  exit 0
+fi
+
+if git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
+  git push "$remote" "$branch" || echo "post-commit auto-push failed; commit was kept locally" >&2
+else
+  git push -u "$remote" "$branch" || echo "post-commit auto-push failed; commit was kept locally" >&2
+fi
+
+exit 0
