@@ -1,20 +1,21 @@
 # Mini-Nanobot
 
-Mini-Nanobot 是一个面向代码任务的轻量级 Agent 框架。它参考现代代码 Agent 的通用工程思想，但实现是原创 Python 版本：双层查询循环、插件式工具、Shell 安全策略、上下文压缩、checkpoint 恢复、两级记忆、技能懒加载、Hook 扩展和子 Agent 集成点。
+Mini-Nanobot is a lightweight Python framework for code-task agents. It provides a small but complete runtime for ReAct-style execution, tool calling, checkpoint recovery, context compression, long-term memory, hooks, and sandboxed shell commands.
 
-## 架构映射
+The project is designed for learning and experimentation: the default offline model lets the framework run without API keys, while the LLM layer can be swapped for an API-backed provider.
 
-- `QueryEngine`：外层会话生命周期，负责 system prompt、memory、skills、预算、checkpoint。
-- `query()`：内层单次 ReAct 循环，负责 LLM 决策、工具执行、结果注入、压缩和恢复。
-- `ToolRegistry`：统一注册内置工具、MCP 适配工具和 AgentTool。
-- `StreamingToolExecutor`：只读工具可并发，写入/危险工具串行并做权限检查。
-- `ContextCompressor`：实现 tool result snip、history snip、microcompact、context collapse、autocompact。
-- `SQLiteCheckpointStore`：每轮工具执行后保存状态，可 resume。
-- `LongTermMemoryStore`：`user / feedback / project / reference` 四类记忆，索引注入 + 召回注入。
-- `SkillManager`：只注入技能元数据，真正调用时再读取 `SKILL.md`。
-- `HookManager`：暴露 `PreToolUse / PostToolUse / SessionStart / SessionEnd / CompactStart / CompactEnd`。
+## Features
 
-## 快速运行
+- ReAct-style agent loop with tool feedback.
+- Plugin-like tool registry based on JSON Schema.
+- Built-in tools for files, ripgrep search, Git, shell commands, skills, and sub-agent integration.
+- Shell command safety checks, workspace path isolation, timeouts, output caps, and permission levels.
+- SQLite checkpoints for resumable long-running tasks.
+- Token-aware context compression with progressive cleanup strategies.
+- Session and long-term memory primitives.
+- Lifecycle hooks for tool and session events.
+
+## Quick Start
 
 ```bash
 python -m mini_nanobot tools
@@ -23,21 +24,26 @@ python -m mini_nanobot sessions
 python -m mini_nanobot bench --file benchmarks/tasks.json
 ```
 
-默认使用离线 `RuleBasedLLM`，便于无 API key 测试。要接真实模型，可安装 `mini-nanobot[openai]` 并使用：
+By default, Mini-Nanobot uses an offline rule-based LLM for deterministic demos. To use an OpenAI-compatible provider:
 
 ```bash
 python -m mini_nanobot run "修复测试失败" --provider openai --execute --write
 ```
 
-## 权限模型
+## Permission Model
 
-- `READ_ONLY`：文件读取、搜索、git status/diff/log/show。
-- `WRITE_WORKSPACE`：文件写入和 patch。
-- `EXECUTE_SAFE`：执行非破坏性 shell 命令。
-- `DANGEROUS`：破坏性命令，默认拒绝。
+- `READ_ONLY`: file reads, search, and safe Git inspection.
+- `WRITE_WORKSPACE`: file writes and patching.
+- `EXECUTE_SAFE`: non-destructive shell commands.
+- `DANGEROUS`: destructive commands, denied by default.
 
-Shell 工具会做危险指令过滤、超时控制、环境变量脱敏、输出上限和工作区隔离。
+## Development
 
-## 面试讲法
+```bash
+python -m pytest -q
+python -m mini_nanobot bench --file benchmarks/tasks.json
+```
 
-这个项目不是 prompt wrapper，而是把代码任务 Agent 拆成五层：会话层、查询状态机、工具协议、安全执行层和上下文/记忆层。复杂任务失败后可以从 SQLite checkpoint 恢复；上下文逼近窗口时先做低成本压缩，最后才做 autocompact；工具错误不会让进程崩溃，而是作为 `tool_result` 返回给模型自我修正。
+## Status
+
+This is a compact educational implementation, not a production coding assistant. It intentionally keeps the architecture easy to inspect and extend.
