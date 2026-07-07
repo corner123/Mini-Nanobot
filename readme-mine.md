@@ -61,14 +61,13 @@ User Task
 
 ```text
 QueryEngine.submit_message()
-  负责一轮用户交互的生命周期：
+  负责一次完整用户对话的全生命周期：
   - 创建或恢复 AgentState
   - 构建 system prompt
   - 注入 memory 和 skills
   - 设置权限、工具、checkpoint、compressor
   - 调用 query()
-
-query()
+query()基于状态机的异步生成器循环
   负责单次 ReAct 执行循环：
   - 压缩上下文
   - 调 LLMProvider
@@ -78,6 +77,26 @@ query()
   - 保存 checkpoint
   - 判断继续或停止
 ```
+
+```
+QueryEngine 实例
+├── submit_message("第一条消息")
+│   └── query()
+│       ├── LLM
+│       ├── tool
+│       ├── LLM
+│       └── final answer
+│
+├── submit_message("第二条消息")
+│   └── query()
+│       ├── LLM
+│       ├── tool
+│       └── final answer
+```
+
+面试里你可以这样说：
+
+> `QueryEngine` 是会话级对象，贯穿整个对话生命周期；用户每发一条消息，会进入一次 `submit_message()`；而 `submit_message()` 会启动一次 `query()`，由 `query()` 执行这条消息对应的多轮 ReAct 循环。也就是说，`submit_message()` 是单条用户消息的外层入口，`query()` 是这条消息内部的执行状态机。
 
 为什么要拆两层：
 
@@ -352,6 +371,14 @@ python -m mini_nanobot resume <session_id>
 答：当前实现保存的是工具 batch 前后的状态。单个工具内部执行到一半崩溃时，最多重跑这一轮工具。生产增强可以为 tool call 增加 `started/running/done` 状态和幂等 key，恢复时判断是否需要补偿。
 
 ## 14. Memory 系统
+
+提示词缓存：
+
+- 稳定内容缓存起来
+- 动态内容放到边界之后
+- memory / skills 作为动态附件注入 messages
+
+
 
 代码在 `mini_nanobot/memory/long_term.py`。
 
@@ -665,3 +692,554 @@ schema 定义在工具类里，`validate_input()` 和 `run()` 属于同一个对
 - Benchmark 样例还少，真实指标需要扩充任务集后再填。
 
 这样讲反而更可信：你知道项目做了什么，也知道边界在哪里。
+
+## 27. 关键概念再梳理：Skill / Tool / Hook / MCP / Function Calling
+
+这一节专门整理最近复习中最容易混的几个概念。它们都围绕“模型如何使用外部能力”，但处在不同层级。
+
+```text
+Function Calling:
+  模型如何表达“我要调用哪个工具，参数是什么”
+
+Tool:
+  Mini-Nanobot 内部真正可执行的能力抽象
+
+Skill:
+  一份任务工作流说明，指导模型如何组织步骤和使用工具
+
+Hook:
+  框架在生命周期节点自动触发的回调，用于审计、拦截、统计等横切逻辑
+
+MCP:
+  外部工具、资源、提示词接入 Agent 的标准协议
+```
+
+完整链路可以记成：
+
+```text
+用户自然语言
+  -> LLM 结合 tools JSON Schema
+  -> Function Calling 输出 tool_call
+  -> ToolRegistry 找到 Tool
+  -> StreamingToolExecutor 执行 Tool
+  -> 如果 Tool 来自 MCP，则通过 MCPToolAdapter 调外部 MCP Server
+  -> ToolResult 写回 messages
+  -> LLM 继续推理或输出最终回答
+```
+
+## 28. Tool 系统
+
+Tool 是模型访问真实环境的唯一入口。模型不能直接读文件、写文件、执行 shell 或访问 Git；它只能输出结构化的 `tool_call`，框架再根据 `tool_call.name` 找到对应 Tool 执行。
+
+Tool 的核心字段：
+
+```text
+name:
+  工具唯一名称，例如 file.read、shell.run
+
+description:
+  给模型看的工具说明
+
+input_schema:
+  JSON Schema，描述工具参数
+
+run():
+  真正执行工具的函数
+
+is_read_only / is_destructive / is_concurrency_safe:
+  工具的安全语义
+
+check_permissions():
+  权限检查
+```
+
+Tool 执行流程：
+
+```text
+1. LLM 输出 tool_call
+2. ToolRegistry 根据 tool_call.name 找 Tool
+3. ToolExecutor 校验参数
+4. 触发 PreToolUse Hook
+5. 检查权限
+6. 执行 tool.run()
+7. 大结果落盘
+8. 触发 PostToolUse Hook
+9. 返回 ToolResult
+10. ToolResult 作为 role="tool" 写回 AgentState.messages
+```
+
+重要面试表述：
+
+> Tool 是框架内部的统一能力抽象。无论工具来自本地代码、Shell、Git、Skill 还是 MCP，最终都要注册成 Tool，导出 JSON Schema 给模型，并通过统一执行器做校验、权限、Hook、结果落盘和上下文注入。
+
+## 29. Skill 系统
+
+Skill 不是执行能力，而是工作流提示词。它告诉模型遇到某类任务时应该怎么做。
+
+```text
+Tool = 能力
+Skill = 方法论
+```
+
+例如 debug skill 可能写：
+
+```text
+1. 先运行测试
+2. 读失败 traceback
+3. 读取最相关测试文件
+4. 搜索实现代码
+5. 做最小修改
+6. 重新运行测试
+```
+
+Skill 的存储形式：
+
+```text
+.nanobot/skills/<skill-name>/SKILL.md
+.claude/skills/<skill-name>/SKILL.md
+```
+
+`SKILL.md` 分两部分：
+
+```text
+frontmatter:
+  name
+  description
+  when_to_use
+  source
+
+body:
+  完整工作流说明
+```
+
+模型如何知道 Skill 存在：
+
+```text
+QueryEngine 每轮调用 SkillManager.render_attachment()
+  -> 扫描技能目录
+  -> 只提取 name / description / when_to_use
+  -> 生成 skills-menu meta message
+  -> 以 role="user", is_meta=True 注入 messages
+```
+
+模型如何调用 Skill：
+
+```text
+模型看到 skills-menu
+  -> 判断当前任务需要某个 skill
+  -> Function Calling 输出 skill.load
+  -> SkillTool 读取完整 SKILL.md body
+  -> body 作为 ToolResult 写回上下文
+  -> 模型根据 Skill 指导继续调用 shell.run / file.read / search.rg 等真正 Tool
+```
+
+最容易混的点：
+
+```text
+Skill 本身不是 Tool。
+skill.load 是 Tool。
+SkillTool 是读取 Skill 的工具。
+Skill 被加载后变成模型可参考的提示词上下文。
+```
+
+当前项目边界：
+
+- 已实现技能发现、元数据注入、按需加载。
+- 已有 `SkillManager._invoked` 和 `AgentState.invoked_skills` 的设计入口。
+- 还没有完整打通“skill.load 后同步到 AgentState.invoked_skills，再在压缩后自动重注入”的闭环。
+- 还没有实现技能信任等级、技能级 Hook、技能安全属性白名单。
+
+## 30. Hook 系统
+
+Hook 是框架预留在关键生命周期节点上的回调插槽。它不是模型调用的 Tool，而是框架自动触发的函数。
+
+一句话：
+
+```text
+Tool 是模型主动调用的能力。
+Hook 是框架在执行流程中自动调用的扩展函数。
+```
+
+当前事件点：
+
+```text
+PreToolUse:
+  工具执行前
+
+PostToolUse:
+  工具执行后
+
+SessionStart:
+  会话开始
+
+SessionEnd:
+  会话结束
+
+CompactStart:
+  上下文压缩前
+
+CompactEnd:
+  上下文压缩后
+```
+
+Hook 解决的是横切逻辑。横切逻辑指“不属于某一个具体工具，但很多工具都需要”的公共逻辑，例如：
+
+```text
+日志记录
+审计
+权限增强
+敏感信息扫描
+指标统计
+自动 lint
+错误上报
+```
+
+如果没有 Hook，这些逻辑就要写进每一个 Tool。Hook 让这些逻辑集中注册，一次生效。
+
+PreToolUse 的能力：
+
+```text
+执行前审计
+拦截危险工具调用
+修改 args
+附加 metadata
+```
+
+PostToolUse 的能力：
+
+```text
+记录工具结果
+统计成功率
+扫描输出
+触发后处理
+```
+
+面试表述：
+
+> Hook 是 Mini-Nanobot 的生命周期扩展机制。Tool 是模型可调用的执行能力，Hook 不暴露给模型，而是在工具执行前后、会话开始结束、上下文压缩前后由框架自动触发。它适合承载审计、日志、权限增强、指标统计这类横切逻辑，从而避免污染具体 Tool 的核心实现。
+
+## 31. MCP
+
+MCP 是 Model Context Protocol，是把外部工具、资源、提示词标准化接入 Agent 的协议。
+
+完整 MCP 能力包括：
+
+```text
+Tools:
+  外部可执行动作
+
+Resources:
+  外部可读取资源，如文档、schema、知识库
+
+Prompts:
+  外部提供的提示词模板或工作流
+
+Server Lifecycle:
+  server 启动、连接、重连、关闭
+
+Auth / Capability Negotiation:
+  授权和能力协商
+```
+
+Mini-Nanobot 当前只实现了 MCP 的最小落地点：
+
+```text
+MCP tool -> MCPToolAdapter -> Mini-Nanobot Tool
+```
+
+当前项目中的 MCP 执行链路：
+
+```text
+外部 MCP Server 暴露 tool
+  -> MCP client 获取 name / description / input_schema
+  -> MCPToolAdapter 包装成 Mini-Nanobot Tool
+  -> 注册到 ToolRegistry
+  -> ToolRegistry.to_model_tools() 发给 LLM
+  -> LLM 输出 tool_call
+  -> ToolExecutor 执行 MCPToolAdapter.run()
+  -> mcp_client.call_tool(name, args)
+  -> 外部 MCP Server 执行
+  -> 返回 ToolResult
+  -> 写回 messages
+```
+
+为什么 MCP 听起来像 Tool：
+
+```text
+因为我们项目当前只实现了 MCP tools adapter。
+完整 MCP 很强，但 MVP 只把 MCP Server 提供的 tool 接入了统一 Tool 系统。
+```
+
+准确表述：
+
+> 当前项目没有完整实现 MCP Client，而是实现了 MCP 工具适配层。它能把外部 MCP Server 暴露的 tools 包装成框架内部统一 Tool，复用 ToolRegistry、权限、Hook、ToolResult 和 checkpoint 流程。后续可以扩展 MCP server discovery、resources 注入和 prompts-to-skills。
+
+## 32. Function Calling
+
+Function Calling 是模型输出结构化工具调用请求的能力。
+
+它做的不是：
+
+```text
+自然语言 -> JSON Schema
+```
+
+而是：
+
+```text
+用户自然语言 + 工具 JSON Schema -> tool_call
+```
+
+边界要记清楚：
+
+```text
+Tool 定义:
+  框架做
+
+Tool -> JSON Schema:
+  ToolRegistry 做
+
+用户自然语言 + JSON Schema -> tool_call:
+  Function Calling / 模型做
+
+tool_call -> 执行 Tool:
+  ToolRegistry + ToolExecutor 做
+```
+
+例子：
+
+```text
+用户：
+  帮我跑测试
+
+工具 schema：
+  shell.run(command: string, timeout_seconds: integer)
+
+Function Calling 输出：
+  {
+    "name": "shell.run",
+    "args": {
+      "command": "python -m pytest -q",
+      "timeout_seconds": 120
+    }
+  }
+
+框架执行：
+  ToolRegistry.get("shell.run")
+  -> ShellTool.run()
+```
+
+Function Calling、Tool、MCP 的区别：
+
+```text
+Function Calling:
+  LLM -> Agent Runtime
+  模型如何表达调用意图
+
+Tool:
+  Agent Runtime 内部统一抽象
+  框架如何执行能力
+
+MCP:
+  Agent Runtime -> 外部服务
+  外部能力如何接入 Agent
+```
+
+一句话：
+
+> Function Calling 是模型侧的结构化调用机制；Tool 是框架侧的执行抽象；MCP 是外部工具和资源接入协议。三者不是同一层，但会在 Agent 工具调用链路中串起来。
+
+## 33. 上下文压缩
+
+上下文窗口不是只包含当前用户输入，而是包含：
+
+```text
+system prompt
+tools schema
+memory / skills meta messages
+历史 user / assistant / tool messages
+历史工具结果
+压缩摘要
+当前用户消息
+协议开销
+预留输出 tokens
+部分模型的 reasoning tokens
+```
+
+所以即使当前用户只发一句话，input context 也可能已经很大。
+
+预算公式：
+
+```text
+max_context_window = input_context + output_tokens + reasoning_tokens
+```
+
+在项目里：
+
+```python
+effective_window = max_context_tokens - output_reserve_tokens
+```
+
+也就是说，我们不能把整个上下文窗口都塞输入，必须给模型输出和推理预留空间。
+
+压缩阈值：
+
+```text
+72%:
+  黄色预警，开始轻量压缩
+
+90%:
+  进入 context collapse
+
+93%:
+  进入 autocompact
+```
+
+72% 的含义：
+
+```text
+不是说 72% 就爆了，而是提前做低损耗清理。
+Agent 上下文增长不稳定，一次工具调用可能突然返回大量日志、diff、搜索结果或文件内容。
+提前清理可以避免等到接近上限时被迫大摘要。
+```
+
+当前压缩流程是渐进式的：
+
+```text
+1. 超过 72% 后，先 history_snip
+2. 再 microcompact
+3. 重新计算 token
+4. 如果仍超过 90%，context_collapse
+5. 再重新计算 token
+6. 如果仍超过 93%，autocompact
+```
+
+即使一开始超过 95%，也不会直接跳到 autocompact，而是按低损耗到高损耗逐层尝试。
+
+当前实现和 Claude Code 五级压缩的对应关系：
+
+```text
+Claude Code Tool Result:
+  我们在 StreamingToolExecutor 中做大输出落盘和 preview
+
+Claude Code History Snip:
+  我们当前没有完整实现
+  当前 _history_snip 实际更像“剩余长 tool message 裁剪”
+
+Claude Code Microcompact:
+  我们保留全局最近 8 条 role="tool" 的消息，旧 tool result 替换成占位
+
+Claude Code Context Collapse:
+  我们把早期非 system messages 折叠成 summary meta message
+
+Claude Code Autocompact:
+  我们做 deterministic summary + recovery attachment
+```
+
+Microcompact 的“最近 8 条”指：
+
+```text
+整个会话中最近 8 条 role="tool" 的消息
+不是每个工具各保留 8 条
+```
+
+为什么是 8：
+
+```text
+这是 MVP 经验值，通常能覆盖最近几轮“读文件 -> 搜索 -> 修改 -> 测试”的工具观察链。
+生产版本应该配置化，并结合任务类型、工具类型和重要性评分。
+```
+
+为什么没有做缓存冷/热和 cache_edits：
+
+```text
+因为当前 Mini-Nanobot 是 provider-agnostic 的轻量实现，
+没有接入真正的 provider prompt cache，
+也没有 message cache reference / cache_edits。
+```
+
+准确边界：
+
+> 当前压缩是 Claude Code 思路的轻量工程化版本，不是完整复刻。它优先使用低损耗规则压缩，再使用摘要压缩；但尚未实现完整 History Snip、cache-aware microcompact 和 provider-level cache edits。
+
+## 34. 当前掌握度与待补知识
+
+根据目前提问，你已经逐渐掌握了这些核心链路：
+
+```text
+1. QueryEngine / query 双层结构
+2. session_id 与 AgentState 的关系
+3. system / user / assistant / tool role 和 is_meta 的区别
+4. meta messages 为什么每轮动态注入
+5. recalled_memory 的轻量关键词召回
+6. checkpoint 为什么用 JSON + SQLite
+7. snapshot checkpoint 和 event sourcing 的区别
+8. Tool / Skill / Hook / MCP / Function Calling 的大致边界
+9. 上下文窗口为什么需要预留输出和提前压缩
+```
+
+目前还容易混的点：
+
+```text
+1. “模型做了什么”和“框架做了什么”的边界
+   例如 Function Calling 只负责模型输出 tool_call，
+   ToolRegistry 和 ToolExecutor 才负责查找和执行工具。
+
+2. “给模型看的数据”和“Python 运行时对象”的区别
+   meta message 会存 checkpoint；
+   SkillManager、HookManager、LLM client 这类运行时对象不会存。
+
+3. “MCP 很强”和“当前项目 MCP 只做 adapter”的区别
+   面试时要说清楚当前实现边界，不能说完整实现了 MCP。
+
+4. “Skill 是工作流提示词”和“Tool 是执行能力”的区别
+   skill.load 是 Tool，但 Skill 本身不是 Tool。
+
+5. 上下文压缩五级策略和我们 MVP 实现之间的差异
+   当前不是完整 Claude Code 压缩系统。
+```
+
+还建议继续补的模块：
+
+```text
+1. Shell Sandbox
+   重点掌握命令危险检测、权限分级、路径隔离、环境变量脱敏、timeout。
+
+2. Tool 并发控制
+   为什么只读工具可并发，写工具/危险工具串行。
+
+3. Permission Model
+   READ_ONLY / WRITE_WORKSPACE / EXECUTE_SAFE / DANGEROUS 如何影响工具执行。
+
+4. Prompt Cache 与动态上下文
+   稳定 system prompt、dynamic boundary、meta messages、未来 provider cache_control 的关系。
+
+5. Long-term Memory 的边界
+   当前是关键词召回，后续如何升级 embedding + rerank。
+
+6. LangGraph 适配
+   当前只是 fallback graph spec，如何升级成真正状态机节点。
+
+7. OpenAIProvider / 真实模型接入
+   如何把不同模型 API 返回的 tool call 映射成统一 ToolCall。
+
+8. Benchmark 设计
+   如何定义任务完成率、工具成功率、压缩 token 降低率、恢复成功率。
+
+9. 多 Agent / AgentTool
+   当前只是扩展点，后续如何实现 fork agent、coordinator、swarm。
+
+10. 生产级 MCP Client
+   server discovery、list_tools、resources、prompts、auth、server lifecycle。
+```
+
+下一轮复习建议顺序：
+
+```text
+1. Shell Sandbox + Permission Model
+2. Tool 并发控制与 ToolExecutor 细节
+3. Prompt Cache / dynamic meta context
+4. Long-term Memory 升级路线
+5. LangGraph 和多 Agent 扩展路线
+6. Benchmark 指标如何真实跑出来
+```
