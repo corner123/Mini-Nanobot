@@ -55,3 +55,24 @@ def test_shell_blocks_dangerous_command(tmp_path: Path) -> None:
 
     assert result.is_error
     assert "dangerous" in result.content.lower() or "blocked" in result.content.lower()
+
+
+def test_agent_run_blocks_recursive_fork(tmp_path: Path) -> None:
+    registry = create_default_registry(tmp_path)
+    ctx = ToolContext(
+        workspace=tmp_path,
+        session_id="s",
+        artifact_dir=tmp_path / ".nanobot",
+        metadata={"fork_depth": 1},
+    )
+    executor = StreamingToolExecutor(registry)
+
+    _, result = run(
+        executor.execute_many(
+            [ToolCall("agent.run", {"description": "nested", "prompt": "try nested delegation"})],
+            ctx,
+        )
+    )[0]
+
+    assert result.is_error
+    assert "recursive" in result.content

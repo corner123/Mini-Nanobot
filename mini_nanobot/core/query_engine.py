@@ -8,6 +8,7 @@ from mini_nanobot.context.tokenizer import TokenCounter
 from mini_nanobot.core.prompts import SystemPromptBuilder
 from mini_nanobot.core.query import query
 from mini_nanobot.core.state import AgentState, Message, QueryEvent
+from mini_nanobot.core.subagent import SubAgentRunner
 from mini_nanobot.hooks.manager import HookManager, SESSION_END, SESSION_START
 from mini_nanobot.llm.base import LLMProvider, RuleBasedLLM
 from mini_nanobot.memory.checkpoint import SQLiteCheckpointStore
@@ -56,6 +57,15 @@ class QueryEngine:
             ContextBudget(max_context_tokens=max_context_tokens),
             self.hooks,
         )
+        self.subagents = SubAgentRunner(
+            workspace=self.workspace,
+            llm=self.llm,
+            registry=self.registry,
+            checkpoint=self.checkpoints,
+            hooks=self.hooks,
+            prompt_builder=self.prompt_builder,
+            max_context_tokens=max_context_tokens,
+        )
 
     async def submit_message(self, task: str, session_id: str | None = None, max_turns: int = 20) -> QueryResult:
         if session_id:
@@ -73,6 +83,8 @@ class QueryEngine:
         state.add_message(Message(role="user", content=task))
         state.metadata["skill_manager"] = self.skills
         state.metadata["fork_depth"] = int(state.metadata.get("fork_depth", 0))
+        state.metadata["fork_runner"] = self.subagents.run
+        state.metadata["subagent_runner"] = self.subagents
 
         events = await query(
             state=state,

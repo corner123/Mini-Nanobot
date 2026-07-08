@@ -1243,3 +1243,165 @@ Microcompact 的“最近 8 条”指：
 5. LangGraph 和多 Agent 扩展路线
 6. Benchmark 指标如何真实跑出来
 ```
+## 31. Multi-Agent Runtime：从 AgentTool 扩展点到可运行子 Agent
+
+之前项目里的 `agent.run` 只是 AgentTool 扩展点：模型能看到“可以委派子任务”的工具 schema，但如果没有 `fork_runner`，它不会真的创建子 Agent。现在已经补成一个可运行的一层 Multi-Agent Runtime。
+
+### 31.1 它解决什么问题
+
+单 Agent 做复杂代码任务时，容易把搜索、分析、修改、验证和总结都挤在同一个上下文里，导致上下文污染、任务链过长、失败难定位。Multi-Agent 的目的不是炫技，而是把独立子任务隔离出去：
+
+```text
+主 Agent：
+  负责理解用户目标、拆分任务、决定是否委派、汇总结果。
+
+子 Agent：
+  负责完成一个边界清晰的小任务，例如只读分析、代码审查、测试定位。
+```
+
+### 31.2 当前实现在哪些文件
+
+```text
+mini_nanobot/tools/agent.py
+  定义 agent.run 和 agent.status 两个 Tool。
+
+mini_nanobot/core/subagent.py
+  定义 SubAgentRunner，真正创建 child AgentState 并调用 query()。
+
+mini_nanobot/core/query_engine.py
+  初始化 SubAgentRunner，并在每轮请求前把 fork_runner 注入 state.metadata。
+
+mini_nanobot/tools/registry.py
+  把 AgentTool 和 AgentStatusTool 注册进默认工具集。
+```
+
+### 31.3 完整执行流程
+
+```text
+1. 用户给主 Agent 一个复杂任务。
+2. QueryEngine 创建或恢复主 AgentState。
+3. QueryEngine 注入 fork_runner / subagent_runner 到 runtime metadata。
+4. query() 调 LLM。
+5. LLM 判断需要委派，输出 agent.run tool_call。
+6. StreamingToolExecutor 执行 AgentTool。
+7. AgentTool 检查 fork_depth，禁止递归 fork。
+8. AgentTool 调用 SubAgentRunner.run()。
+9. SubAgentRunner 创建 child AgentState。
+10. 子 Agent 注入独立 system prompt 和 parent-delegation meta message。
+11. SubAgentRunner 根据 subagent_type 生成受限工具白名单和权限集合。
+12. 子 Agent 调用 query(child_state)，自己走 ReAct 循环。
+13. 子 Agent 工具结果和消息写入自己的 AgentState。
+14. SQLiteCheckpointStore 保存子 Agent checkpoint。
+15. 子 Agent 完成后生成 <subagent-result> 结构化结果。
+16. 主 Agent 把这个结果作为 agent.run 的 ToolResult 写回上下文。
+17. 主 Agent 基于子 Agent 结论继续推理或最终回复。
+```
+
+### 31.4 子 Agent 的隔离方式
+
+当前实现的是 `in_process` 一层子 Agent，不是无限递归 swarm。
+
+```text
+上下文隔离：
+  子 Agent 有自己的 AgentState.messages，不直接污染主 Agent 历史。
+
+状态隔离：
+  子 Agent 有自己的 session_id 和 checkpoint。
+
+工具隔离：
+  子 Agent 只能看到 reduced ToolRegistry。
+
+权限隔离：
+  子 Agent 权限从父 Agent 权限降级而来，不能凭空获得写权限或执行权限。
+
+递归隔离：
+  fork_depth >= 1 时 agent.run 会拒绝，避免子 Agent 再 fork 子 Agent。
+```
+
+### 31.5 子 Agent 类型和工具权限
+
+当前有几种 profile：
+
+```text
+default / researcher / reviewer:
+  默认只读，只能 file.read、file.list、search.rg、git.status、git.diff、git.show、git.log、skill.load。
+
+tester:
+  在父 Agent 有 EXECUTE_SAFE 权限时，额外允许 shell.run。
+
+coder:
+  在父 Agent 有 WRITE_WORKSPACE 权限时，允许 file.write / file.patch；
+  在父 Agent 有 EXECUTE_SAFE 权限时，允许 shell.run。
+```
+
+这体现了一个关键原则：
+
+```text
+子 Agent 权限 <= 父 Agent 权限
+```
+
+也就是说，父 Agent 没有写权限时，子 Agent 即使声明自己是 coder，也不会拿到写工具。
+
+### 31.6 为什么结果要结构化返回
+
+子 Agent 不应该把所有中间工具输出原样塞回主 Agent，否则多 Agent 反而会制造上下文噪声。当前返回的是：
+
+```xml
+<subagent-result id="..." type="researcher" status="completed">
+Name: researcher
+Child session: ...
+Allowed tools: ...
+Permissions: ...
+
+Summary:
+子 Agent 最终结论
+
+Recent files:
+- ...
+
+Tool events:
+- file.list: ok
+
+Notes:
+- 权限降级或工具过滤说明
+</subagent-result>
+```
+
+主 Agent 拿到的是子任务结论、最近文件、工具执行概览和风险说明，而不是完整原始日志。
+
+### 31.7 和 Claude Code 思路的对应关系
+
+这个实现借鉴的是“子任务委派 + 上下文隔离 + 工具作用域控制”的思想，而不是完整复刻 Claude Code。
+
+相似点：
+
+```text
+- 子 Agent 作为工具暴露给主 Agent。
+- 子 Agent 有独立上下文。
+- 子 Agent 只返回压缩后的结果。
+- 通过 fork_depth 控制递归风险。
+- 通过 tool scope 控制子 Agent 能力边界。
+```
+
+当前边界：
+
+```text
+- 已实现 in-process 子 Agent。
+- 已实现一层 delegation。
+- 已实现子 Agent checkpoint。
+- 已实现工具白名单和权限降级。
+- 已实现后台 task_id + agent.status 的轻量查询入口。
+- 未实现真正 git worktree 隔离。
+- 未实现 remote worker。
+- 未实现复杂 coordinator/swarm/投票聚合。
+```
+
+### 31.8 面试回答
+
+可以这样说：
+
+> 我最初把多 Agent 设计成 `agent.run` 扩展点，后来补成了一个可运行的一层子 Agent Runtime。主 Agent 可以通过 Function Calling 调用 `agent.run`，把独立子任务委派给 `SubAgentRunner`。Runner 会创建新的 child AgentState，注入子 Agent system prompt 和 parent-delegation meta message，再根据 subagent_type 生成受限 ToolRegistry 和权限集合，调用同一个 query loop 让子 Agent 独立完成任务。子 Agent 的 messages、tool_events 和 checkpoint 都和主 Agent 分离，完成后只把结构化摘要作为 ToolResult 返回给主 Agent。为了控制复杂度和安全风险，我禁止递归 fork，并保证子 Agent 权限不会超过父 Agent。
+
+如果面试官问“这和完整多 Agent swarm 有什么区别”，回答：
+
+> 我这里实现的是工程上更可控的一层 delegation，不是开放式 swarm。开放式 swarm 需要 coordinator、worker pool、任务投票、冲突解决、远程调度和更强隔离。我当前重点是让代码任务 Agent 能安全地把只读分析、测试定位、局部审查这类子任务委派出去，同时保持 checkpoint、工具权限和上下文边界清晰。

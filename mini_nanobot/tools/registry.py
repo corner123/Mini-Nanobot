@@ -37,7 +37,7 @@ class ToolRegistry:
 
 
 def create_default_registry(workspace=None) -> ToolRegistry:
-    from mini_nanobot.tools.agent import AgentTool
+    from mini_nanobot.tools.agent import AgentStatusTool, AgentTool
     from mini_nanobot.tools.filesystem import FileListTool, FilePatchTool, FileReadTool, FileWriteTool
     from mini_nanobot.tools.git import GitDiffTool, GitLogTool, GitShowTool, GitStatusTool
     from mini_nanobot.tools.search import RgSearchTool
@@ -59,6 +59,7 @@ def create_default_registry(workspace=None) -> ToolRegistry:
             ShellTool(),
             SkillTool(),
             AgentTool(),
+            AgentStatusTool(),
         ]
     )
     return registry

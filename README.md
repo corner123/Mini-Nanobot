@@ -8,12 +8,18 @@ The project is designed for learning and experimentation: the default offline mo
 
 - ReAct-style agent loop with tool feedback.
 - Plugin-like tool registry based on JSON Schema.
-- Built-in tools for files, ripgrep search, Git, shell commands, skills, and sub-agent integration.
+- Built-in tools for files, ripgrep search, Git, shell commands, skills, and one-layer sub-agent delegation.
 - Shell command safety checks, workspace path isolation, timeouts, output caps, and permission levels.
 - SQLite checkpoints for resumable long-running tasks.
 - Token-aware context compression with progressive cleanup strategies.
 - Session and long-term memory primitives.
 - Lifecycle hooks for tool and session events.
+
+## Multi-Agent Runtime
+
+Mini-Nanobot includes a runnable one-layer sub-agent runtime. The main agent can call `agent.run` to delegate an isolated task to an in-process child agent. The child agent gets its own `AgentState`, system prompt, checkpoint, reduced tool registry, and permission scope, then returns a compact structured result to the parent agent.
+
+The default policy is conservative: recursive delegation is disabled, read-only researcher/reviewer agents are the default, and coder/tester profiles only receive write or execute tools when the parent permission context allows them.
 
 ## Quick Start
 
