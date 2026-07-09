@@ -62,6 +62,7 @@ class AgentState:
     task: str
     session_id: str = field(default_factory=lambda: uuid4().hex)
     messages: list[Message] = field(default_factory=list)
+    context_projection: list[Message] = field(default_factory=list)
     plan: list[PlanStep] = field(default_factory=list)
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
@@ -79,6 +80,15 @@ class AgentState:
 
     def add_message(self, message: Message) -> None:
         self.messages.append(message)
+        if self.context_projection:
+            self.context_projection.append(message)
+        self.updated_at = utc_now()
+
+    def active_messages(self) -> list[Message]:
+        return self.context_projection or self.messages
+
+    def set_context_projection(self, messages: list[Message]) -> None:
+        self.context_projection = messages
         self.updated_at = utc_now()
 
     def add_tool_event(self, event: dict[str, Any]) -> None:
@@ -104,6 +114,7 @@ class AgentState:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AgentState":
         messages = [Message(**m) for m in data.get("messages", [])]
+        context_projection = [Message(**m) for m in data.get("context_projection", [])]
         plan = [PlanStep(**s) for s in data.get("plan", [])]
         usage_data = data.get("usage", {})
         usage = Usage(**usage_data)
@@ -111,6 +122,7 @@ class AgentState:
             task=data["task"],
             session_id=data.get("session_id") or uuid4().hex,
             messages=messages,
+            context_projection=context_projection,
             plan=plan,
             tool_events=data.get("tool_events", []),
             usage=usage,

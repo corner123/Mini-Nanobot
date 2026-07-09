@@ -1237,14 +1237,35 @@ effective_window = max_context_tokens - output_reserve_tokens
 history_snip_threshold = 0.72
 collapse_threshold = 0.90
 autocompact_threshold = 0.93
+microcompact_keep_tool_results = 5
+cache_reference_ttl_seconds = 300
+```
+
+另外 `AgentState` 现在有两份上下文视图：
+
+```text
+messages:
+  原始会话历史，保留 canonical history。
+
+context_projection:
+  给模型看的压缩投影视图。为空时使用 messages；非空时 query() 调 LLM 使用 projection。
 ```
 
 ### 14.3 工作流程
 
+Level 1 发生在工具执行阶段：
+
+```text
+StreamingToolExecutor._persist_if_large()
+  -> 单次 ToolResult 超过工具预算
+  -> 完整内容写入 .nanobot/artifacts/<session_id>/tool-results/
+  -> messages 里只放 head + tail + Full output path
+```
+
 每轮 LLM 前：
 
 ```text
-before = count_messages(state.messages)
+before = count_messages(state.active_messages())
 if before < 72% effective_window:
   不压缩
 
@@ -1262,34 +1283,52 @@ if before < 72% effective_window:
 压缩层级：
 
 ```text
+Level 1 Tool Result 预算裁剪:
+  新工具结果刚产生时处理。
+  完整结果落盘，上下文只保留紧凑 preview 和 artifact path。
+
 history_snip:
-  裁剪长 tool message。
+  启发式清理历史冗余。
+  包括重复工具输出、被后续编辑覆盖的中间编辑尝试，以及超长 tool message 头尾裁剪。
 
 microcompact:
-  旧 tool result 替换成提示，保留最近 8 条。
+  只保留最近 5 条 tool result。
+  更旧的 tool result 如果仍在 5 分钟 cache ttl 内，替换成 cache_reference 风格占位；
+  如果过期，则直接替换成 removed placeholder，可附 artifact path。
 
 context_collapse:
-  更早历史变成摘要 meta message。
+  创建 projection，不删除原始 messages。
+  projection = system + context-collapse summary + 最近 6 条消息。
 
 autocompact:
-  极限压缩，保留 recovery attachment。
+  最后兜底。
+  优先调用 runtime compact_summarizer 生成摘要；没有配置或失败时用确定性 fallback。
+  projection = autocompact summary + recovery attachment + 最近 4 条消息。
 ```
 
 ### 14.4 局限性
 
-当前压缩是确定性规则：
+当前实现是对五级流水线的工程化版本：
 
 ```text
-没有 LLM summary provider
-History Snip 不完整
-没有 cache-aware microcompact
-没有 provider cache reference
-压缩摘要质量有限
+已实现：
+  Tool Result 落盘预览
+  History Snip 的重复输出清理、被覆盖编辑清理、长工具结果裁剪
+  Microcompact 最近 5 条工具结果保留
+  cache_reference 风格占位
+  Context Collapse projection，不删除原始 messages
+  Autocompact 可插拔 summary agent + fallback
+
+仍是 MVP：
+  cache_reference 只是占位协议，没有真实服务端 KV cache mask
+  History Snip 启发式规则还很简单
+  projection 是模型上下文投影，不是前端 UI 折叠
+  summary agent 只在配置真实 LLM 时有意义，RuleBasedLLM 会 fallback
 ```
 
 ### 14.5 面试说法
 
-> 我在每轮 LLM 调用前检查 token 预算，超过阈值就按低损耗到高损耗逐层压缩：先裁剪长工具结果，再清理旧工具结果，再折叠历史，最后 autocompact。这样能避免长任务因为工具结果膨胀而爆上下文。
+> 我把上下文压缩做成渐进式流水线。工具结果刚产生时先做预算裁剪和落盘预览；每轮 LLM 前再做 History Snip，清理重复工具输出和被覆盖的编辑尝试；然后 Microcompact 只保留最近 5 条工具结果，并用 cache_reference 风格占位表示仍可能复用缓存；如果还超限，就创建不删除原始 messages 的 context projection；最后才 Autocompact，用 summary agent 或 fallback 摘要生成恢复上下文。
 
 ---
 
@@ -2593,28 +2632,69 @@ effective_window = 28k
 history_snip -> microcompact -> 重新计算 -> context_collapse -> 重新计算 -> autocompact
 ```
 
-Microcompact 的“最近 8 条工具结果”是什么意思？
+五级压缩分别做什么？
 
 ```text
-是全局最近 8 条 role="tool" 消息，
-不是每个工具各保留 8 条。
+Level 1: Tool Result 预算裁剪
+  发生在工具刚执行完。
+  对单次工具结果设置最大上下文预算。
+  超过预算时完整内容落盘，messages 只保留紧凑 preview 和 artifact path。
+
+Level 2: History Snip
+  发生在上下文压缩阶段。
+  用启发式规则清理历史冗余：
+    - 重复工具输出，例如多次 ls/file.list 得到相同内容。
+    - 被后续编辑覆盖的中间 file.write/file.patch 尝试。
+    - 仍然很长的 tool message 做 head-tail 裁剪。
+
+Level 3: Microcompact
+  只保留全局最近 5 条 role="tool" 消息。
+  更早的工具结果如果在 5 分钟 cache ttl 内，替换成 cache_reference 风格占位。
+  如果已经过期，直接替换成 removed placeholder，并尽量保留 artifact path。
+
+Level 4: Context Collapse
+  不删除原始 state.messages。
+  创建 state.context_projection，作为下一次 LLM 调用的模型上下文视图。
+  projection 中保留 system、context-collapse summary 和最近 6 条消息。
+
+Level 5: Autocompact
+  最后兜底。
+  优先调用 QueryEngine 注入的 compact_summarizer，使用 summary child state 生成摘要。
+  如果没有真实 LLM 或 summarizer 失败，就用确定性 fallback summary。
+  projection 中保留 autocompact summary、recovery attachment 和最近 4 条消息。
 ```
 
-为什么是 8？
+Microcompact 的“最近 5 条工具结果”是什么意思？
 
 ```text
-MVP 经验值。
+是全局最近 5 条 role="tool" 消息，
+不是每个工具各保留 5 条。
 目的是保留最近观察结果，减少旧工具结果占用。
 生产级可以基于任务、文件引用、冷热缓存和 provider prompt cache 做更细策略。
 ```
 
-当前没做什么：
+cache_reference 在当前项目里是什么？
 
 ```text
-没有 cache-aware microcompact
-没有根据 cache reference/cache edits 保留热内容
-没有 LLM 语义摘要
-没有 provider-level prompt cache
+它是一个“协议占位”，不是服务端真实 KV cache。
+
+当前项目没有 provider 级 prompt cache 控制权，所以不能真的让服务端 mask 某段工具结果。
+我们做的是：
+  - 如果旧 tool result 仍在 5 分钟 TTL 内，就写入 [microcompact cache_reference=xxx] 占位。
+  - 这个占位表达“真实系统中这里可以引用服务端缓存”。
+  - 未来接 provider cache 时，可以把这个 id 映射为真正 cache reference。
+```
+
+Context Collapse 为什么说不删除原始消息？
+
+```text
+因为 AgentState 现在有：
+  messages: 原始历史
+  context_projection: 模型上下文投影视图
+
+query() 调 LLM 时使用 state.active_messages()。
+如果 context_projection 存在，模型看到 projection；
+但 state.messages 仍然保留完整 canonical history。
 ```
 
 ### 28.7 Tool、Skill、Hook、MCP、Function Calling 的边界

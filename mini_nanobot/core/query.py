@@ -50,7 +50,7 @@ async def query(
 
         state.turns += 1
         events.append(QueryEvent("llm.start", {"turn": state.turns}))
-        response = await llm.generate(state.messages, registry.to_model_tools(), state)
+        response = await llm.generate(state.active_messages(), registry.to_model_tools(), state)
         state.usage.add(response.usage)
 
         if response.text:

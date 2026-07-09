@@ -85,6 +85,7 @@ class QueryEngine:
         state.metadata["fork_depth"] = int(state.metadata.get("fork_depth", 0))
         state.metadata["fork_runner"] = self.subagents.run
         state.metadata["subagent_runner"] = self.subagents
+        state.metadata["compact_summarizer"] = self._compact_with_summary_agent
 
         events = await query(
             state=state,
@@ -117,3 +118,42 @@ class QueryEngine:
         skill_menu = self.skills.render_attachment()
         if "The following skills are available:" in skill_menu:
             state.add_message(Message(role="user", content=skill_menu, is_meta=True, name="skills-menu"))
+
+    async def _compact_with_summary_agent(self, parent_state: AgentState, messages: list[Message], mode: str) -> str:
+        if getattr(self.llm, "name", "") == "rule-based":
+            return ""
+        child = AgentState(
+            task=f"Summarize context for {parent_state.session_id}",
+            query_source="compact",
+        )
+        child.metadata["parent_session_id"] = parent_state.session_id
+        child.add_message(
+            Message(
+                role="system",
+                content=(
+                    "You are a context compaction sub-agent. Summarize the conversation for continuation. "
+                    "Preserve the task goal, completed work, key decisions, tool observations, file paths, "
+                    "open risks, and next steps. Do not call tools."
+                ),
+            )
+        )
+        child.add_message(
+            Message(
+                role="user",
+                content=(
+                    f"Mode: {mode}\n"
+                    f"Parent task: {parent_state.task}\n\n"
+                    "Conversation excerpts:\n"
+                    + "\n".join(f"- {message.role} {message.name or ''}: {message.short(1200)}" for message in messages[-80:])
+                ),
+            )
+        )
+        response = await self.llm.generate(child.messages, [], child)
+        if not response.text.strip():
+            return ""
+        return (
+            f"<system-reminder name=\"{mode}\" source=\"summary_agent\">\n"
+            "Compressed conversation state produced by a summary sub-agent.\n\n"
+            f"{response.text.strip()}\n"
+            "</system-reminder>"
+        )
