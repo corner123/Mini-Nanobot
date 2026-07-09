@@ -1405,3 +1405,466 @@ Notes:
 如果面试官问“这和完整多 Agent swarm 有什么区别”，回答：
 
 > 我这里实现的是工程上更可控的一层 delegation，不是开放式 swarm。开放式 swarm 需要 coordinator、worker pool、任务投票、冲突解决、远程调度和更强隔离。我当前重点是让代码任务 Agent 能安全地把只读分析、测试定位、局部审查这类子任务委派出去，同时保持 checkpoint、工具权限和上下文边界清晰。
+
+## 32. 核心模块总复盘：从一次请求串起整个 Agent Runtime
+
+这一节把已经学过的 ReAct 编排、Tool System、Shell Sandbox、Memory、Checkpoint、上下文压缩与召回、Skill、Hook、权限模型、Multi-Agent、LangGraph 串成一条完整链路，用来面试前快速复盘。
+
+### 32.1 一段话总览
+
+Mini-Nanobot 当前采用手写 ReAct Loop 编排，而不是 LangGraph 主编排。用户发来一条消息后，外层 `QueryEngine.submit_message()` 负责创建或恢复 `AgentState`，注入稳定 system prompt、长期记忆索引、相关记忆召回、skills menu 和 runtime metadata，然后追加当前用户真实消息；内层 `query()` 进入 ReAct 循环，每轮先由 `ContextCompressor` 检查上下文窗口，必要时压缩历史和工具结果，再把 messages 与 ToolRegistry 导出的 JSON Schema 一起交给 LLM。LLM 如果返回 tool_calls，就由 `StreamingToolExecutor` 统一完成参数校验、PreToolUse Hook、权限检查、工具执行、大结果落盘、PostToolUse Hook 和 ToolResult 写回；随后 `SQLiteCheckpointStore` 保存 AgentState 快照，模型再基于工具结果继续推理。若模型不再调用工具，则保存最终回复并结束。Shell Sandbox 负责降低 shell.run 风险，Memory 负责跨会话知识召回，Skill 负责按需加载任务方法论，Hook 负责审计和横切逻辑，Multi-Agent 允许主 Agent 通过 agent.run 委派一层受限子 Agent，LangGraph 当前只是未来把这个手写循环节点化的适配点。
+
+### 32.2 ReAct 编排：项目主执行方式
+
+当前项目真正运行任务的是：
+
+```text
+QueryEngine.submit_message()
+  -> query()
+      -> while not completed:
+           compress_if_needed()
+           llm.generate()
+           if tool_calls:
+             executor.execute_many()
+             write tool results
+             checkpoint.save()
+             continue
+           else:
+             final response
+             checkpoint.save()
+             break
+```
+
+`QueryEngine` 是会话级编排器，负责 session 生命周期、prompt/memory/skill 注入、权限和运行时对象注入。`query()` 是单条用户消息内部的请求级编排器，负责真正的多轮 ReAct Loop。
+
+面试说法：
+
+> 当前 Mini-Nanobot 用手写 ReAct Loop 做主编排，外层 QueryEngine 管会话生命周期，内层 query 管 LLM 推理、工具调用、结果反馈和 checkpoint。这样比一上来依赖框架更容易解释状态流和恢复逻辑，也方便后续迁移到 LangGraph。
+
+### 32.3 Prompt 与动态上下文
+
+模型每次看到的内容不是只有用户输入，而是多个部分共同组成：
+
+```text
+system prompt:
+  稳定身份、ReAct 规则、工具使用原则、安全边界。
+
+meta messages:
+  memory-index、recalled-memory、skills-menu、context summary、parent-delegation 等动态信息。
+
+user message:
+  用户本轮真实请求。
+
+tool schemas:
+  ToolRegistry.to_model_tools() 导出的 JSON Schema。
+```
+
+`is_meta=True` 不是 API role，而是框架内部标记，用来区分“系统动态注入的 user-role 信息”和“用户真实输入”。动态信息用 `<system-reminder>` 包装，是为了让模型知道这些内容是运行时提醒，不是用户自然语言请求。
+
+### 32.4 Tool System 与 Function Calling
+
+LLM 不直接读文件、写文件或执行 shell。它只能根据工具 JSON Schema 输出结构化 tool_call：
+
+```json
+{"name": "file.read", "args": {"path": "mini_nanobot/core/state.py"}}
+```
+
+框架侧流程是：
+
+```text
+LLM 输出 tool_call.name
+  -> ToolRegistry.get(name)
+  -> 找到对应 Tool 实例
+  -> StreamingToolExecutor.execute_one()
+  -> tool.run(args, ctx)
+  -> ToolResult 写回 messages
+```
+
+这里要区分：
+
+```text
+tool name:
+  暴露给模型看的字符串，例如 agent.run、file.read、shell.run。
+
+Tool class:
+  Python 里实现这个工具的类，例如 AgentTool、FileReadTool、ShellTool。
+
+run():
+  Tool 抽象基类定义的统一执行接口。
+```
+
+面试说法：
+
+> Function Calling 负责让模型根据 JSON Schema 生成 tool_call；ToolSystem 负责把这个 tool_call 映射到 Python Tool 对象，并执行参数校验、权限检查、Hook、结果落盘和上下文写回。
+
+### 32.5 权限模型：能不能做
+
+权限模型回答的是：
+
+```text
+这个工具调用是否被允许？
+```
+
+当前权限级别：
+
+```text
+READ_ONLY:
+  读文件、搜索、git status/diff/log/show。
+
+WRITE_WORKSPACE:
+  file.write、file.patch。
+
+EXECUTE_SAFE:
+  非破坏性 shell.run。
+
+DANGEROUS:
+  高风险破坏性命令，默认不开放。
+```
+
+每个 Tool 可以实现 `check_permissions()`。例如 `file.write` 需要 `WRITE_WORKSPACE`；`shell.run` 会结合命令安全策略判断只读、普通执行或危险命令。
+
+面试说法：
+
+> 权限模型是执行前授权层，决定某个 tool_call 能不能做；它是跨工具的，不只属于 shell。
+
+### 32.6 Shell Sandbox：允许后怎么受限执行
+
+Shell Sandbox 不是强虚拟化沙箱，而是本地轻量安全层。它回答的是：
+
+```text
+如果允许执行 shell，如何尽量降低风险？
+```
+
+当前实现包括：
+
+```text
+CommandSafetyPolicy:
+  危险命令黑名单、破坏性命令识别、只读命令识别。
+
+ShellTool:
+  对模型暴露 shell.run schema，做权限判断。
+
+ShellSandboxExecutor:
+  真正启动子进程，限制 cwd、timeout、环境变量、stdout/stderr 输出长度。
+```
+
+注意：
+
+```text
+权限模型 = 能不能执行。
+Shell Sandbox = 执行时怎么限制风险。
+```
+
+生产级还需要 Docker/Firecracker/seccomp/低权限用户/网络隔离/只读挂载等。
+
+### 32.7 Checkpoint：长任务中断恢复
+
+Checkpoint 保存的是 `AgentState` 当前快照，不是 event sourcing。
+
+```text
+AgentState.to_json()
+  -> SQLite checkpoints.state_json
+
+SQLite state_json
+  -> AgentState.from_json()
+```
+
+保存时机：
+
+```text
+LLM 输出 tool_calls 后
+工具执行完成后
+最终回复后
+max_turns 停止时
+```
+
+它保存的是可恢复的业务状态：
+
+```text
+messages
+tool_events
+plan
+usage
+recent_files
+compacted_summaries
+completed
+final_response
+```
+
+运行时对象不会保存，例如：
+
+```text
+LLM client
+SkillManager
+HookManager
+SubAgentRunner
+fork_runner
+```
+
+这些对象在恢复会话时由 `QueryEngine` 重新注入。
+
+### 32.8 Memory System：短期记忆与长期记忆
+
+短期记忆是当前 session 的 `AgentState`：
+
+```text
+messages
+tool_events
+recent_files
+compacted_summaries
+plan
+```
+
+长期记忆是跨会话的 Markdown 记录，存储在：
+
+```text
+.nanobot/memory/{workspace_hash}/memory/
+```
+
+结构大概是：
+
+```text
+MEMORY.md
+user_*.md
+feedback_*.md
+project_*.md
+reference_*.md
+```
+
+`MEMORY.md` 是索引，存标题和摘要；真正参与召回的是具体 `user/project/feedback/reference` 文件的 `title + summary + body`。
+
+每轮请求前：
+
+```text
+1. 注入 memory-index。
+2. 根据当前 query 做关键词召回。
+3. 把 top 记忆包装成 recalled-memory meta message。
+4. 提醒模型：memory 只是 hint，使用前要验证当前代码。
+```
+
+### 32.9 上下文压缩与召回
+
+上下文窗口里包括：
+
+```text
+system prompt
+tool schemas
+meta messages
+历史 user/assistant/tool messages
+工具结果
+压缩摘要
+当前用户消息
+输出预留 tokens
+```
+
+压缩不是等上下文满了才做，而是提前在阈值附近逐级处理：
+
+```text
+history_snip:
+  裁剪长工具结果。
+
+microcompact:
+  清理旧工具结果，只保留最近若干条。
+
+context_collapse:
+  把更早历史折叠成摘要。
+
+autocompact:
+  极限压缩，保留恢复信息和最近上下文。
+```
+
+召回和压缩是配套的：
+
+```text
+压缩负责把当前上下文压小。
+召回负责在下一轮重新拿回与当前任务相关的长期记忆。
+```
+
+### 32.10 Skill System：方法论懒加载
+
+Skill 是工作流提示词，不是执行能力。
+
+```text
+Tool = 能力
+Skill = 方法论
+```
+
+存储形式：
+
+```text
+.nanobot/skills/<name>/SKILL.md
+.claude/skills/<name>/SKILL.md
+```
+
+每轮 `QueryEngine` 会注入 `skills-menu`，只列出技能名称和使用场景。模型如果认为需要某个技能，就调用：
+
+```text
+skill.load
+```
+
+`SkillTool` 读取完整 `SKILL.md`，把方法论作为 ToolResult 写回上下文。之后模型根据 Skill 指导再调用真实工具，例如 `file.read`、`search.rg`、`shell.run`。
+
+### 32.11 Hook：横切逻辑扩展点
+
+Hook 不是模型可调用工具，而是框架在生命周期节点自动触发的回调。
+
+当前事件：
+
+```text
+SessionStart
+SessionEnd
+PreToolUse
+PostToolUse
+CompactStart
+CompactEnd
+```
+
+典型用途：
+
+```text
+审计日志
+指标统计
+权限增强
+危险行为拦截
+结果扫描
+上下文压缩观测
+```
+
+面试说法：
+
+> Hook 解决的是横切逻辑。它不属于某个具体 Tool，但很多阶段都需要，比如审计、日志、权限增强和指标统计。把这些写成 Hook，可以避免污染 Tool 的核心实现。
+
+### 32.12 Multi-Agent：一层受限子 Agent
+
+当前已经实现可运行的一层 in-process 子 Agent。
+
+主 Agent 调用：
+
+```text
+agent.run
+```
+
+流程是：
+
+```text
+LLM 输出 agent.run tool_call
+  -> ToolRegistry 找到 AgentTool
+  -> ToolExecutor 调 AgentTool.run()
+  -> AgentTool 检查 fork_depth
+  -> AgentTool 调 fork_runner
+  -> fork_runner 实际是 SubAgentRunner.run()
+  -> SubAgentRunner 创建 child AgentState
+  -> 注入子 Agent system prompt 和 parent-delegation meta message
+  -> 根据 subagent_type 生成工具白名单和权限
+  -> 调 query(child_state)
+  -> 返回 <subagent-result>
+```
+
+子 Agent 隔离内容：
+
+```text
+独立 AgentState
+独立 messages
+独立 tool_events
+独立 session_id
+独立 checkpoint
+受限 ToolRegistry
+受限权限集合
+```
+
+当前 profile：
+
+```text
+researcher / reviewer / default:
+  默认只读。
+
+tester:
+  父 Agent 有 EXECUTE_SAFE 时才允许 shell.run。
+
+coder:
+  父 Agent 有 WRITE_WORKSPACE 时才允许 file.write/file.patch；
+  父 Agent 有 EXECUTE_SAFE 时才允许 shell.run。
+```
+
+核心原则：
+
+```text
+子 Agent 权限 <= 父 Agent 权限
+禁止递归 fork
+子 Agent 不直接污染主 Agent messages
+子 Agent 只把结构化结论返回给主 Agent
+```
+
+### 32.13 LangGraph：当前是适配点，不是主编排
+
+当前项目的主编排方式是手写 ReAct Loop，不是 LangGraph。
+
+`mini_nanobot/core/graph.py` 里的 `build_query_graph()` 只是表达未来可以拆出的节点：
+
+```text
+prepare_context
+llm_decision
+execute_tools
+checkpoint
+finish
+```
+
+如果未来改成 LangGraph，应该把 `query()` 里的 while loop 拆成真实节点：
+
+```text
+prepare_context:
+  上下文压缩、动态上下文准备。
+
+llm_decision:
+  调 LLM，得到 text/tool_calls。
+
+execute_tools:
+  调 StreamingToolExecutor。
+
+checkpoint:
+  保存 AgentState。
+
+finish:
+  设置 final_response 和 completed。
+```
+
+然后用条件边控制：
+
+```text
+有 tool_calls -> execute_tools -> checkpoint -> llm_decision
+无 tool_calls -> finish
+```
+
+面试说法：
+
+> 当前 Mini-Nanobot 是手写 ReAct Loop 编排，LangGraph 是未来状态机化的适配点。真正迁移 LangGraph 后，query() 可以保留为外部 API，但内部应调用 compiled graph，而不是再维护一套 while loop。
+
+### 32.14 最容易被追问的边界
+
+面试时要诚实区分“已实现”和“MVP/预留”：
+
+```text
+已实现：
+  手写 ReAct Loop
+  ToolRegistry / ToolExecutor
+  ShellTool 轻量 sandbox
+  SQLite snapshot checkpoint
+  长期记忆 Markdown 存储和关键词召回
+  上下文渐进式压缩
+  Skill 发现和 skill.load 懒加载
+  Hook 生命周期扩展点
+  PermissionLevel 权限模型
+  一层 in-process Multi-Agent
+
+MVP / 预留：
+  LangGraph 不是主执行引擎
+  MCP 只是工具适配层，不是完整 MCP Client
+  Shell Sandbox 不是强容器隔离
+  Prompt Cache 只是 cache-friendly prompt layout，不是 provider-level token cache
+  Benchmark 当前是 smoke benchmark，不是大规模论文级评测
+  Multi-Agent 没有 remote worker / git worktree 隔离 / 开放式 swarm
+```
+
+### 32.15 一句话面试总述
+
+> Mini-Nanobot 是一个以手写 ReAct Loop 为核心的轻量代码任务 Agent Runtime。它通过 QueryEngine 管理会话，通过 AgentState 承载短期状态，通过 ToolRegistry 和 StreamingToolExecutor 统一工具协议与副作用执行，通过权限模型和 Shell Sandbox 控制风险，通过 Checkpoint 支持中断恢复，通过 Memory、Skill 和上下文压缩维持长任务连续性，通过 Hook 提供审计和横切扩展，通过一层 SubAgentRunner 支持受限子 Agent 委派；LangGraph 当前作为未来图编排适配点，而不是主执行路径。
