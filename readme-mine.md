@@ -2142,3 +2142,1042 @@ Shell 安全看 Sandbox
 最终一句话：
 
 > Mini-Nanobot 当前是一个以手写 ReAct Loop 为核心的轻量代码任务 Agent Runtime，重点展示 Agent 执行闭环、工具安全、状态恢复、上下文管理和一层子 Agent 委派；LangGraph、MCP、Prompt Cache 和强沙箱都保留了扩展方向，但不会在面试中夸成完整生产级实现。
+
+---
+
+## 28. 深度追问版：把之前问过的细节补齐
+
+前面 1-27 章是结构化主线，这一章是面试追问版。它专门补那些容易被问到、也容易混淆的细节：一次完整对话怎么流动、meta message 为什么每轮注入、长期记忆到底查哪里、checkpoint 为什么存 JSON、上下文窗口里到底有什么、Multi-Agent 的 `fork_runner` 在哪里开始、LangGraph 为什么只是适配点、LLMProvider 怎么接真实模型。
+
+### 28.1 从开启一个对话到连续两轮消息，系统完整做了什么
+
+第一轮用户输入：
+
+```text
+帮我分析 checkpoint 是怎么做的
+```
+
+系统执行：
+
+```text
+1. QueryEngine.submit_message(task, session_id=None)
+2. 因为没有 session_id，创建新的 AgentState
+3. AgentState 生成新的 session_id
+4. SystemPromptBuilder.build(workspace) 生成 system prompt
+5. state.messages 加入 role="system" 的稳定规则
+6. _inject_dynamic_context(state, task)
+   - 注入 memory-index
+   - 根据 task 召回 recalled-memory
+   - 注入 skills-menu
+7. 加入用户真实消息 role="user", is_meta=False
+8. 注入 runtime metadata
+   - skill_manager
+   - fork_depth
+   - fork_runner
+   - subagent_runner
+9. 调 query(state)
+10. query 每轮先检查上下文压缩
+11. LLMProvider.generate(messages, tools, state)
+12. 模型根据工具 schema 可能输出 file.read / search.rg 等 tool_calls
+13. ToolExecutor 执行工具
+14. 工具结果写回 role="tool"
+15. checkpoint.save(state)
+16. LLM 再读工具结果继续推理
+17. 模型最终不再调用工具，返回文本
+18. state.completed = True
+19. state.final_response = response.text
+20. checkpoint.save(state)
+```
+
+第二轮用户输入：
+
+```text
+那它和 event sourcing 有什么区别？
+```
+
+系统执行：
+
+```text
+1. QueryEngine.submit_message(task, session_id=上一轮 session_id)
+2. SQLiteCheckpointStore.load(session_id)
+3. AgentState.from_json(state_json)
+4. 恢复上一轮 messages / tool_events / recent_files / summaries
+5. state.completed = False
+6. 重新注入本轮动态上下文
+   - memory-index 可能仍然注入
+   - recalled-memory 会基于新问题重新召回
+   - skills-menu 会重新扫描
+7. 追加当前用户真实消息
+8. 重新注入 runtime metadata
+   - 因为 fork_runner / skill_manager 这类运行时对象不进 checkpoint
+9. 调 query(state)
+10. query 在历史上下文 + 本轮 meta + 本轮 user message 的基础上继续执行
+```
+
+关键理解：
+
+```text
+第二轮不是把旧 prompt 和新 prompt “融合成一个字符串”。
+第二轮是在已有 AgentState.messages 后面追加本轮动态 meta messages 和当前用户真实消息。
+```
+
+易错说法：
+
+```text
+错：第二轮会重新生成一个全新的上下文。
+对：第二轮会恢复同一个 session_id 对应的 AgentState，再追加本轮输入。
+
+错：checkpoint 保存了 Python 运行时对象。
+对：checkpoint 只保存 JSON 可序列化状态，运行时对象由 QueryEngine 重新注入。
+```
+
+### 28.2 system prompt、user message、meta message 到底怎么区分
+
+真实 API message role 通常有：
+
+```text
+system
+user
+assistant
+tool
+```
+
+Mini-Nanobot 的 `Message` 也有这些 role。
+
+但是项目多了一个内部字段：
+
+```python
+is_meta: bool
+```
+
+它不是 API role，而是框架内部标记。
+
+三类最重要的消息：
+
+```text
+system prompt:
+  role="system"
+  is_meta=False
+  内容是稳定规则，例如 Agent 身份、安全原则、工具使用原则。
+
+用户真实请求:
+  role="user"
+  is_meta=False
+  内容是用户本轮真正说的话。
+
+动态 meta message:
+  role="user"
+  is_meta=True
+  内容是框架注入的 memory、skills、压缩摘要、parent delegation 等。
+```
+
+为什么很多动态信息也用 `role="user"`？
+
+```text
+因为不同 LLM API 对自定义 role 支持有限。
+很多系统级动态信息只能通过 user-role message 注入。
+为了避免和用户真实输入混淆，框架用 is_meta=True 标记。
+```
+
+为什么包 `<system-reminder>`？
+
+```text
+这是内容标签，不是 API role。
+它提醒模型：这段内容是运行时系统提醒，不是用户自然语言请求。
+```
+
+用户说：
+
+```text
+你是一名腾讯大厂技术面试官，请帮我...
+```
+
+这不是 system prompt，而是：
+
+```text
+role="user", is_meta=False
+```
+
+它的优先级低于真正 system prompt。
+
+面试说法：
+
+> Mini-Nanobot 区分 API role 和内部 meta 标记。真正的 system prompt 放稳定规则；用户真实输入是普通 user message；memory、skills、压缩摘要等动态上下文用 role=user 但标记 is_meta=True，并用 `<system-reminder>` 包装。
+
+### 28.3 为什么每一轮都要重新注入 meta messages
+
+很多人会问：
+
+```text
+既然是同一个 session，上一轮已经注入过 memory 和 skills，为什么下一轮还要注入？
+```
+
+原因：
+
+```text
+1. 当前用户问题变了，recalled-memory 应该重新按新 query 召回。
+2. 长任务中上下文可能被压缩，旧 meta message 可能已经不在 tail 附近。
+3. skills 目录可能变化，需要重新扫描。
+4. 动态信息靠近当前用户消息，模型更容易利用。
+5. 未来 AGENTS.md、上传文件索引、MCP resources 都可能每轮变化。
+```
+
+当前每轮注入：
+
+```text
+memory-index
+recalled-memory
+skills-menu
+```
+
+未来可以注入：
+
+```text
+AGENTS.md / project instructions
+用户上传文件索引
+MCP resources
+最近压缩恢复信息
+安全策略变化
+当前 git branch/status
+```
+
+局限性：
+
+```text
+当前 MVP 可能重复注入相似 meta messages。
+生产级应该做去重、版本 hash、只在变化时注入。
+```
+
+一句话：
+
+> 动态 meta message 不是“继承旧内容”，而是每轮根据当前问题和当前环境重新生成，让模型在最新上下文里拿到最相关的提示。
+
+### 28.4 长期记忆到底查哪里，MEMORY.md 又是什么
+
+长期记忆路径：
+
+```text
+.nanobot/memory/{workspace_hash}/memory/
+```
+
+例子：
+
+```text
+.nanobot/memory/abc123.../memory/
+├── MEMORY.md
+├── user_interview_style.md
+├── feedback_explain_from_problem.md
+├── project_checkpoint_snapshot.md
+└── reference_claude_code_memory.md
+```
+
+`MEMORY.md` 是索引，不是完整正文。
+
+它存：
+
+```markdown
+# Memory Index
+
+- [Interview Style](user_interview_style.md) - 用户希望从问题出发讲解。
+- [Checkpoint Snapshot](project_checkpoint_snapshot.md) - Mini-Nanobot 使用 SQLite snapshot。
+```
+
+真正参与召回的是具体 memory 文件：
+
+```text
+user_*.md
+feedback_*.md
+project_*.md
+reference_*.md
+```
+
+召回范围：
+
+```text
+只查当前 workspace_hash 下的 memory。
+不会查所有 workspace 的 memory。
+```
+
+召回字段：
+
+```text
+title + summary + body
+```
+
+不直接查 `MEMORY.md` 做匹配。`MEMORY.md` 的作用是：
+
+```text
+每轮作为 memory-index 给模型看，让模型知道长期记忆库里有哪些条目。
+```
+
+召回流程：
+
+```text
+1. 当前用户 query 分词。
+2. 遍历当前 workspace_hash 下具体 memory 文件。
+3. 跳过 MEMORY.md。
+4. 解析 frontmatter 和 body。
+5. 在 title + summary + body 中匹配关键词。
+6. 命中越多 score 越高。
+7. 取 top 5。
+8. 包装成 recalled-memory meta message。
+```
+
+为什么召回后加这句话：
+
+```text
+Treat recalled memory as a hint. Verify paths/functions against the current workspace before relying on it.
+```
+
+因为长期记忆可能过期。模型应该把它当线索，而不是绝对事实。
+
+易错说法：
+
+```text
+错：MEMORY.md 里存完整记忆。
+对：MEMORY.md 是索引，完整内容在具体 memory 文件。
+
+错：召回会查所有项目的记忆。
+对：当前只查当前 workspace hash 下的记忆。
+
+错：记忆召回后模型可以直接相信。
+对：记忆只是 hint，当前代码和工具验证优先。
+```
+
+### 28.5 Checkpoint 为什么一定要 JSON，为什么运行时对象不能保存
+
+Checkpoint 保存的是：
+
+```text
+AgentState 的可恢复业务状态
+```
+
+通过：
+
+```python
+AgentState.to_json()
+```
+
+存到 SQLite：
+
+```text
+checkpoints.state_json
+```
+
+为什么转 JSON：
+
+```text
+1. 可读，方便调试。
+2. 可存 SQLite。
+3. 跨语言友好。
+4. 强迫状态只包含数据，不包含运行时对象。
+5. 恢复路径明确：from_json -> AgentState。
+```
+
+保存：
+
+```text
+messages
+tool_events
+usage
+turns
+recent_files
+compacted_summaries
+completed
+final_response
+```
+
+不保存：
+
+```text
+LLM client
+SkillManager
+HookManager
+SubAgentRunner
+fork_runner
+数据库连接
+函数对象
+subprocess process
+asyncio task
+文件句柄
+```
+
+为什么不能保存运行时对象：
+
+```text
+1. JSON 无法序列化函数、连接、进程句柄等对象。
+2. 这些对象和当前进程生命周期绑定，重启后即使反序列化也不可用。
+3. 保存它们会让 checkpoint 变成不可移植、不可调试。
+4. 恢复时应该重新创建运行环境，而不是复活旧对象。
+```
+
+`is_meta=True` 的消息是不是运行时对象？
+
+```text
+不是。
+meta message 仍然是 Message 数据，content 是字符串，可以 JSON 序列化。
+运行时对象是 Python 函数、manager、client、连接、任务等。
+```
+
+为什么是 snapshot，不是 event sourcing：
+
+```text
+snapshot:
+  保存“现在是什么状态”。
+
+event sourcing:
+  保存“状态如何一步步变化”。
+```
+
+当前项目优先恢复最新状态，所以 snapshot 更简单。
+
+### 28.6 上下文窗口中到底有什么，为什么 72% 就压缩
+
+上下文窗口不只是用户输入。
+
+里面包括：
+
+```text
+system prompt
+tool schemas
+memory-index
+recalled-memory
+skills-menu
+历史 user messages
+历史 assistant messages
+tool call records
+tool results
+context-collapse summaries
+autocompact summaries
+当前用户消息
+协议开销
+输出 tokens 预留
+模型 reasoning tokens
+```
+
+假设：
+
+```text
+max_context_tokens = 32k
+output_reserve_tokens = 4k
+```
+
+有效输入窗口：
+
+```text
+effective_window = 28k
+```
+
+72% 的意思：
+
+```text
+不是上下文爆了。
+而是进入黄色预警区，开始做低损耗压缩。
+```
+
+为什么不是等 100%：
+
+```text
+1. 工具结果可能突然很大。
+2. token 估算可能有误差。
+3. 模型还要输出。
+4. 有些模型还有 reasoning token。
+5. 提前做低损耗压缩比最后强制 autocompact 更安全。
+```
+
+超过 90% 是否直接 autocompact？
+
+```text
+不是。
+当前会按层级走：
+history_snip -> microcompact -> 重新计算 -> context_collapse -> 重新计算 -> autocompact
+```
+
+Microcompact 的“最近 8 条工具结果”是什么意思？
+
+```text
+是全局最近 8 条 role="tool" 消息，
+不是每个工具各保留 8 条。
+```
+
+为什么是 8？
+
+```text
+MVP 经验值。
+目的是保留最近观察结果，减少旧工具结果占用。
+生产级可以基于任务、文件引用、冷热缓存和 provider prompt cache 做更细策略。
+```
+
+当前没做什么：
+
+```text
+没有 cache-aware microcompact
+没有根据 cache reference/cache edits 保留热内容
+没有 LLM 语义摘要
+没有 provider-level prompt cache
+```
+
+### 28.7 Tool、Skill、Hook、MCP、Function Calling 的边界
+
+这五个概念最容易混。
+
+一句话区分：
+
+```text
+Function Calling:
+  模型如何表达“我要调用工具”。
+
+Tool:
+  框架内部统一执行能力。
+
+Skill:
+  工作流提示词，告诉模型怎么做。
+
+Hook:
+  框架生命周期回调，不暴露给模型。
+
+MCP:
+  外部工具/资源接入 Agent 的协议。
+```
+
+完整链路：
+
+```text
+用户自然语言
+  -> LLM 结合 tools JSON Schema
+  -> Function Calling 输出 tool_call
+  -> ToolRegistry 根据 tool_call.name 找 Tool
+  -> ToolExecutor 执行 Tool
+  -> 如果 Tool 来自 MCP，则 MCPToolAdapter 调外部 server
+  -> ToolResult 写回 messages
+  -> LLM 继续推理
+```
+
+Skill 的位置：
+
+```text
+skills-menu 告诉模型有哪些 Skill
+模型调用 skill.load
+SkillTool 读取 SKILL.md
+Skill 内容作为 ToolResult 写回上下文
+模型根据 Skill 方法论调用真正 Tool
+```
+
+Hook 的位置：
+
+```text
+ToolExecutor 在执行 Tool 前后自动触发
+模型不知道 Hook 存在
+```
+
+MCP 的位置：
+
+```text
+模型不知道 MCP
+模型只看到普通 Tool schema
+Runtime 通过 MCPToolAdapter 把外部 MCP tool 包装成内部 Tool
+```
+
+易错说法：
+
+```text
+错：Skill 也是 Tool。
+对：skill.load 是 Tool，Skill 本身是提示词工作流。
+
+错：Hook 是模型可以调用的工具。
+对：Hook 是框架自动调用的生命周期函数。
+
+错：Function Calling 会执行工具。
+对：Function Calling 只让模型输出 tool_call。
+
+错：MCP 和 Function Calling 是同一个东西。
+对：Function Calling 是模型到 Runtime；MCP 是 Runtime 到外部 Server。
+```
+
+### 28.8 ShellTool 为什么看起来像接口，它到底做什么
+
+`ShellTool` 的确像适配接口，因为它不是直接把所有 shell 逻辑写死。
+
+它的作用是把 shell 命令执行包装成 Agent Tool：
+
+```text
+对模型:
+  暴露 shell.run schema。
+
+对权限模型:
+  判断命令是 read-only、normal、destructive。
+
+对 sandbox:
+  调 ShellSandboxExecutor 真正执行。
+
+对上下文:
+  把 stdout/stderr 包装成 ToolResult。
+```
+
+层级：
+
+```text
+LLM:
+  输出 shell.run tool_call
+
+ShellTool:
+  工具适配层，做 schema、权限语义、结果包装
+
+CommandSafetyPolicy:
+  命令安全判断
+
+ShellSandboxExecutor:
+  真正 subprocess 执行
+```
+
+CWD 是：
+
+```text
+current working directory
+命令执行时所在目录
+```
+
+项目中固定为：
+
+```text
+ctx.workspace
+```
+
+避免命令跑到系统目录或未知目录。
+
+### 28.9 权限模型为什么不放进 Sandbox
+
+因为权限模型不是 Shell 专属。
+
+它还管：
+
+```text
+file.write
+file.patch
+git mutation
+agent.run 子 Agent 权限降级
+MCP tools
+未来外部服务写入
+```
+
+Sandbox 主要管：
+
+```text
+允许 shell 执行后，如何限制执行环境和风险。
+```
+
+所以两者分层：
+
+```text
+Permission Model:
+  能不能做。
+
+Sandbox:
+  允许做之后怎么受限执行。
+```
+
+如果把权限都塞进 sandbox，会导致：
+
+```text
+file.write 等非 shell 工具无法复用权限逻辑
+权限策略和执行隔离耦合
+子 Agent 权限降级不好做
+```
+
+### 28.10 Multi-Agent 里 fork_depth、fork_runner、SubAgentRunner.run 到底在哪里
+
+原始 ToolExecutor 流程没有变：
+
+```text
+ToolExecutor
+  -> registry.get(tool_call.name)
+  -> validate_input
+  -> PreToolUse Hook
+  -> check_permissions
+  -> tool.run()
+  -> PostToolUse Hook
+  -> ToolResult
+```
+
+当：
+
+```text
+tool_call.name == "agent.run"
+```
+
+ToolRegistry 找到的是：
+
+```text
+AgentTool 实例
+```
+
+因为：
+
+```python
+class AgentTool(Tool):
+    name = "agent.run"
+```
+
+所以：
+
+```text
+tool.run() 实际就是 AgentTool.run()
+```
+
+`AgentTool.run()` 里面：
+
+```text
+1. depth = ctx.metadata.get("fork_depth", 0)
+2. depth >= 1 就拒绝 recursive fork
+3. fork_runner = ctx.metadata.get("fork_runner")
+4. await fork_runner(args, ctx)
+```
+
+`fork_runner` 从哪里来？
+
+在 `QueryEngine.submit_message()` 中注入：
+
+```python
+state.metadata["fork_runner"] = self.subagents.run
+state.metadata["subagent_runner"] = self.subagents
+```
+
+所以：
+
+```text
+fork_runner 实际就是 SubAgentRunner.run
+```
+
+为什么这样设计？
+
+```text
+AgentTool 是工具层，不应该直接 new SubAgentRunner。
+SubAgentRunner 需要 workspace、llm、registry、checkpoint、hooks 等运行时依赖。
+这些依赖由 QueryEngine 拥有。
+所以 QueryEngine 注入 fork_runner，AgentTool 只调用它。
+```
+
+完整展开：
+
+```text
+ToolExecutor 调 AgentTool.run()
+  -> AgentTool 检查 fork_depth
+  -> AgentTool 调 fork_runner
+      -> SubAgentRunner.run()
+          -> 创建 child AgentState
+          -> 注入 child system prompt
+          -> 生成 child registry / permissions
+          -> 调 query(child_state)
+          -> 返回 SubAgentResult
+  -> AgentTool 返回 ToolResult
+  -> ToolExecutor 触发 PostToolUse
+```
+
+### 28.11 子 Agent profile 是不是提前写好的 Agent
+
+是预先写在代码里的 profile，但不是独立 Agent 类。
+
+当前：
+
+```text
+researcher
+reviewer
+tester
+coder
+default
+```
+
+它们只是工具和权限模板。
+
+例如：
+
+```text
+reviewer:
+  默认只读工具。
+
+tester:
+  只读 + shell.run，但前提是父 Agent 有 EXECUTE_SAFE。
+
+coder:
+  只读 + file.write/file.patch/shell.run，但前提是父 Agent 有对应权限。
+```
+
+创建子 Agent 时：
+
+```text
+SubAgentRunner 不是创建 ReviewerAgent 类。
+它创建普通 child AgentState。
+然后根据 subagent_type 给它不同工具白名单和权限。
+```
+
+一句话：
+
+> profile 是子 Agent 权限模板，不是多个独立 Agent 实现。
+
+未来可升级：
+
+```yaml
+profiles:
+  reviewer:
+    allowed_tools:
+      - file.read
+      - search.rg
+      - git.diff
+    max_turns: 8
+    system_addendum: |
+      You are a careful reviewer...
+```
+
+### 28.12 LangGraph 如果真正实现，要不要删 query
+
+当前：
+
+```text
+query() = 主执行 loop
+graph.py = 适配点
+```
+
+真正迁移 LangGraph 后，不一定删 `query()` 这个函数。
+
+更合理：
+
+```text
+保留 query() 作为外部 API
+把 query() 内部的 while loop 换成 compiled_graph.ainvoke()
+```
+
+不要同时维护：
+
+```text
+query() 里一套 loop
+LangGraph 里又一套 loop
+```
+
+否则会导致：
+
+```text
+checkpoint 时机不一致
+工具执行逻辑重复
+上下文压缩时机不同
+bug 难定位
+```
+
+LangGraph 节点应该是：
+
+```text
+prepare_context:
+  压缩上下文、准备动态上下文。
+
+llm_decision:
+  调 LLM。
+
+execute_tools:
+  调 ToolExecutor。
+
+checkpoint:
+  保存状态。
+
+finish:
+  结束。
+```
+
+条件边：
+
+```text
+有 tool_calls -> execute_tools -> checkpoint -> llm_decision
+无 tool_calls -> finish
+```
+
+### 28.13 LLMProvider、离线模型、本地模型、API 模型怎么区分
+
+`LLMProvider` 是模型适配层。
+
+项目统一调用：
+
+```python
+llm.generate(messages, tools, state)
+```
+
+当前 provider：
+
+```text
+RuleBasedLLM:
+  离线规则模型，不是真本地大模型。
+
+ScriptedLLM:
+  测试用，按预设返回 LLMResponse。
+
+OpenAIProvider:
+  调 OpenAI API。
+```
+
+离线模型在当前项目中指：
+
+```text
+RuleBasedLLM
+```
+
+它不是：
+
+```text
+Ollama
+Qwen 本地部署
+DeepSeek 本地服务
+Llama.cpp
+vLLM
+```
+
+它只是规则 demo：
+
+```text
+看到 list files -> 返回 file.list
+看到 search -> 返回 search.rg
+```
+
+API 模式：
+
+```powershell
+$env:OPENAI_API_KEY="你的 key"
+python -m mini_nanobot run "分析项目结构" --provider openai --model gpt-4.1-mini
+```
+
+当前没有登录流程，OpenAI SDK 读取：
+
+```text
+OPENAI_API_KEY
+```
+
+如果要接本地大模型，需要新增：
+
+```text
+OllamaProvider
+LocalOpenAICompatibleProvider
+VLLMProvider
+```
+
+只要实现：
+
+```python
+generate(messages, tools, state) -> LLMResponse
+```
+
+`query()` 不需要改。
+
+### 28.14 Benchmark 为什么不是论文专属
+
+Benchmark 在论文里是评测基准，在工程里也可以是回归基准。
+
+Agent 项目尤其需要 benchmark，因为它有很多不稳定因素：
+
+```text
+模型输出变化
+工具调用失败
+权限拦截
+上下文压缩丢信息
+checkpoint 恢复失败
+multi-agent 委派失败
+```
+
+当前 benchmark 做：
+
+```text
+读取 benchmarks/tasks.json
+运行每个 task
+检查 expect_contains
+统计 completion_rate
+统计 tool_success_rate
+统计 seconds
+```
+
+当前是 smoke benchmark。
+
+未来要做成简历指标，需要扩展：
+
+```text
+30+ 文件搜索任务
+30+ 文件修改任务
+20+ 测试修复任务
+10+ checkpoint resume 任务
+10+ 上下文压缩任务
+10+ multi-agent 委派任务
+```
+
+指标：
+
+```text
+任务完成率
+工具调用成功率
+平均工具调用次数
+平均耗时
+压缩前后 token 降幅
+resume 成功率
+子 Agent 委派成功率
+```
+
+### 28.15 Claude Agent SDK 迁移时状态会发生什么变化
+
+如果迁移 Claude Agent SDK，Mini-Nanobot 的角色会变化。
+
+当前：
+
+```text
+Mini-Nanobot 自己实现 Agent Runtime
+```
+
+迁移后：
+
+```text
+Claude Agent SDK 提供 Runtime
+Mini-Nanobot 变成应用层策略包装
+```
+
+会被弱化或替换：
+
+```text
+query() ReAct Loop
+ToolExecutor
+ContextCompressor
+SubAgentRunner
+部分 Checkpoint
+```
+
+仍然保留价值：
+
+```text
+LongTermMemoryStore
+Benchmark
+CLI
+权限策略映射
+业务 session mapping
+自定义 MCP tools
+项目知识管理
+```
+
+状态变化：
+
+```text
+现在:
+  SQLite 保存完整 AgentState JSON。
+
+迁移后:
+  SDK 保存 session transcript。
+  Mini-Nanobot SQLite 保存业务索引：
+    nanobot_session_id
+    sdk_session_id
+    workspace
+    task
+    final_response
+    memory_refs
+    benchmark metrics
+```
+
+最稳方案：
+
+```text
+保留 local runtime backend
+新增 claude-agent-sdk backend
+```
+
+面试说法：
+
+> 我不会把自研 Runtime 完全删掉。自研版本展示我理解 ReAct、工具执行、checkpoint 和上下文管理的底层机制；Claude Agent SDK backend 则展示如何对接企业级 Agent Runtime。
